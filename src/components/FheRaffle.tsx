@@ -1,0 +1,1803 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import { ethers } from "ethers";
+import { userDecryptBatch } from "../lib/fhevm";
+import { ToastContainer, useToast } from "./Toast";
+import { RAFFLE_ABI } from "../lib/abis/Raffle";
+import { ERC20_ABI } from "../lib/abis/ERC20";
+import RaffleDrawAnimation from "./RaffleDrawAnimation";
+import ClaimConfetti from "./ClaimConfetti";
+import {
+  Clock,
+  Users,
+  Trophy,
+  Ticket,
+  Crown,
+  AlertCircle,
+  CheckCircle2,
+  Loader2,
+  HelpCircle,
+  X,
+} from "lucide-react";
+import { Card } from "./ui/Card";
+import { StatsBar as RaffleStatsBar } from "./ui/StatsBar";
+
+// Contract configuration - Sepolia only
+const CONTRACT_ADDRESS = import.meta.env.VITE_RAFFLE_CONTRACT_ADDRESS_SEPOLIA || '';
+
+interface FheRaffleProps {
+  account: string;
+  chainId: number;
+  isConnected: boolean;
+  fhevmStatus: 'idle' | 'loading' | 'ready' | 'error';
+  onMessage: (message: string) => void;
+}
+
+interface PoolData {
+  poolId: number;
+  startTime: bigint;
+  endTime: bigint;
+  totalEntries: bigint;
+  totalAmount: bigint;
+  isClosed: boolean;
+  winnersDrawn: boolean;
+  participantCount: bigint;
+}
+
+interface WinnerData {
+  address: string;
+  percentage: bigint;
+  reward: bigint;
+  claimed: boolean;
+}
+
+interface PastPoolData extends PoolData {
+  winners?: WinnerData[];
+  userWinnerInfo?: { isWinner: boolean; reward: bigint; claimed: boolean };
+  winnerIndexHandles?: string[];
+  indicesGenerated?: boolean;
+}
+
+export default function FheRaffle({ account, chainId, isConnected, fhevmStatus }: FheRaffleProps) {
+  const { toasts, addToast, removeToast, updateToast } = useToast();
+  const [contractAddress, setContractAddress] = useState<string>('');
+  const [mazaTokenAddress, setMazaTokenAddress] = useState<string>('');
+  const [entryFee, setEntryFee] = useState<string>('0');
+  const [currentPoolId, setCurrentPoolId] = useState<number>(0);
+  const [poolData, setPoolData] = useState<PoolData | null>(null);
+  const [winners, setWinners] = useState<WinnerData[]>([]);
+  const [pastPools, setPastPools] = useState<PastPoolData[]>([]);
+  const [timeRemaining, setTimeRemaining] = useState<number>(0);
+  const [isOwner, setIsOwner] = useState<boolean>(false);
+  const [mazaBalance, setMazaBalance] = useState<string>('0');
+  const [mazaAllowance, setMazaAllowance] = useState<string>('0');
+  const [isLoadingBalance, setIsLoadingBalance] = useState<boolean>(true); // Start as true to prevent showing insufficient before load
+  const [hasLoadedBalanceOnce, setHasLoadedBalanceOnce] = useState<boolean>(false);
+  const previousAccountRef = useRef<string | undefined>(undefined);
+  const [isLoadingDrawnPools, setIsLoadingDrawnPools] = useState<boolean>(true); // Start as true to show skeleton on initial load
+  const [hasLoadedDrawnPoolsOnce, setHasLoadedDrawnPoolsOnce] = useState<boolean>(false); // Track if pools have been loaded at least once
+  const [isLoadingPoolData, setIsLoadingPoolData] = useState<boolean>(true); // Track initial pool data loading
+  const [showFAQ, setShowFAQ] = useState<boolean>(false);
+  const [showClaimConfetti, setShowClaimConfetti] = useState<boolean>(false);
+  const lastLoadedPoolIdRef = useRef<number>(-1); // Track last pool ID we loaded past pools for
+  const [isEntering, setIsEntering] = useState<boolean>(false);
+  const [isApproving, setIsApproving] = useState<boolean>(false);
+  const [isDrawingWinners, setIsDrawingWinners] = useState<boolean>(false);
+  const [isClaiming, setIsClaiming] = useState<boolean>(false);
+  const [userWinnerInfo, setUserWinnerInfo] = useState<{ isWinner: boolean; reward: bigint; claimed: boolean } | null>(null);
+  const [hasEnteredCurrentPool, setHasEnteredCurrentPool] = useState<boolean>(false);
+  const [showPastPools, setShowPastPools] = useState<boolean>(true); // Show by default
+  const [expandedPoolId, setExpandedPoolId] = useState<number | null>(null);
+  const [showDrawAnimation, setShowDrawAnimation] = useState<boolean>(false);
+  const [participantAddresses, setParticipantAddresses] = useState<string[]>([]);
+  const toastShownRef = useRef<number | null>(null);
+  const [ethereumProvider, setEthereumProvider] = useState<any>(null);
+
+  // Helper function to truncate address
+  const truncateAddress = (address: string) => {
+    if (!address) return '';
+    return `${address.slice(0, 6)}...${address.slice(-4)}`;
+  };
+
+  // Helper function to format percentage
+  const formatPercentage = (percentage: bigint) => {
+    // Percentage is in basis points (e.g., 2000 = 20%)
+    return (Number(percentage) / 100).toFixed(1);
+  };
+
+  // Detect ethereum provider with mobile support
+  useEffect(() => {
+    const detectProvider = () => {
+      // Check for ethereum provider in various locations (mobile compatibility)
+      const providers = [
+        (window as any).ethereum,
+        (window as any).ethereum?.providers?.[0],
+        (window as any).ethereum?.providers?.find((p: any) => p.isMetaMask),
+        (window as any).web3?.currentProvider,
+      ].filter(Boolean);
+
+      if (providers.length > 0) {
+        setEthereumProvider(providers[0]);
+      } else {
+        // Retry detection for mobile browsers
+        const retry = setTimeout(() => {
+          const retryProviders = [
+            (window as any).ethereum,
+            (window as any).ethereum?.providers?.[0],
+            (window as any).ethereum?.providers?.find((p: any) => p.isMetaMask),
+          ].filter(Boolean);
+          if (retryProviders.length > 0) {
+            setEthereumProvider(retryProviders[0]);
+          }
+        }, 1000);
+        return () => clearTimeout(retry);
+      }
+    };
+
+    detectProvider();
+    
+    // Listen for provider injection (mobile browsers)
+    const checkInterval = setInterval(() => {
+      if (!ethereumProvider && (window as any).ethereum) {
+        detectProvider();
+      }
+    }, 500);
+
+    return () => clearInterval(checkInterval);
+  }, [ethereumProvider]);
+
+  // Initialize contract address - Sepolia only
+  useEffect(() => {
+    if (CONTRACT_ADDRESS && CONTRACT_ADDRESS !== '') {
+      setContractAddress(CONTRACT_ADDRESS);
+      toastShownRef.current = null; // Reset when address is found
+    } else if (chainId === 11155111 && toastShownRef.current !== chainId) {
+      // Only show toast once for Sepolia
+      toastShownRef.current = chainId;
+      addToast('Raffle contract address not configured. Please set VITE_RAFFLE_CONTRACT_ADDRESS_SEPOLIA in .env', 'warning');
+    }
+  }, [chainId, addToast]);
+
+  // Load contract data with real-time updates
+  const loadContractData = useCallback(async () => {
+    if (!contractAddress) {
+      return;
+    }
+
+    const ethereum = ethereumProvider || (window as any).ethereum;
+    if (!ethereum) {
+      return;
+    }
+
+    try {
+      const provider = new ethers.BrowserProvider(ethereum);
+      const contract = new ethers.Contract(contractAddress, RAFFLE_ABI, provider);
+
+      // Get current pool ID
+      const poolId = await contract.getCurrentPoolId();
+      setCurrentPoolId(Number(poolId));
+
+      // Get pool data
+      const pool = await contract.getPool(poolId);
+      setIsLoadingPoolData(false);
+      setPoolData({
+        poolId: Number(poolId),
+        startTime: pool.startTime,
+        endTime: pool.endTime,
+        totalEntries: pool.totalEntries,
+        totalAmount: pool.totalAmount,
+        isClosed: pool.isClosed,
+        winnersDrawn: pool.winnersDrawn,
+        participantCount: pool.participantCount,
+      });
+
+      // Get entry fee
+      const fee = await contract.ENTRY_FEE();
+      setEntryFee(ethers.formatEther(fee));
+
+      // Get MAZA token address
+      const tokenAddr = await contract.mazaToken();
+      setMazaTokenAddress(tokenAddr);
+
+      // Check if user is owner
+      const ownerAddr = await contract.owner();
+      setIsOwner(ownerAddr.toLowerCase() === account.toLowerCase());
+
+      // Check if user has already entered this pool
+      if (account) {
+        try {
+          const hasEntered = await contract.hasEnteredPool(poolId, account);
+          setHasEnteredCurrentPool(hasEntered);
+        } catch (error) {
+          // Function might not exist in older contracts, default to false
+          setHasEnteredCurrentPool(false);
+        }
+      } else {
+        setHasEnteredCurrentPool(false);
+      }
+
+      // Load MAZA balance and allowance (only on first load, skip in periodic updates)
+      // Balance is loaded separately on initial mount, not here to avoid flickering
+
+      // Load participants for animation
+      try {
+        const participants = await contract.getPoolParticipants(poolId);
+        setParticipantAddresses(participants || []);
+      } catch (error) {
+        // Function might not exist in older contracts, ignore
+      }
+
+      // Load winners if pool is closed
+      if (pool.winnersDrawn) {
+        await loadWinners(Number(poolId), contract);
+      }
+
+      // Check if user is a winner
+      if (account) {
+        await checkUserWinnerStatus(Number(poolId), contract);
+      }
+
+      // Only reload past pools if pool ID changed (new pool created) or on initial load
+      const currentPoolIdNum = Number(poolId);
+      if (currentPoolIdNum !== lastLoadedPoolIdRef.current || !hasLoadedDrawnPoolsOnce) {
+        // Load past pools with loading indicator on initial load only
+        await loadPastPools(currentPoolIdNum, contract, !hasLoadedDrawnPoolsOnce);
+        lastLoadedPoolIdRef.current = currentPoolIdNum;
+      }
+    } catch (error: any) {
+      // Silently handle errors - UI will show default/empty state
+      setIsLoadingDrawnPools(false); // Stop loading even on error
+      setHasLoadedDrawnPoolsOnce(true); // Mark as attempted even on error
+    }
+  }, [contractAddress, account, ethereumProvider]);
+
+  // Calculate time remaining based on poolData
+  const updateTimeRemaining = useCallback(() => {
+    if (poolData && poolData.startTime > 0n && poolData.endTime > 0n) {
+      const now = Math.floor(Date.now() / 1000);
+      const remaining = Number(poolData.endTime) - now;
+      setTimeRemaining(Math.max(0, remaining));
+    } else {
+      setTimeRemaining(0);
+    }
+  }, [poolData]);
+
+  // Real-time updates every 3 seconds (without reloading balance to prevent flickering)
+  useEffect(() => {
+    // Load immediately when conditions are met
+    if (isConnected && contractAddress) {
+      // Load immediately, don't wait for FHEVM on mobile
+      loadContractData();
+      
+      const interval = setInterval(() => {
+        loadContractData();
+      }, 3000); // Update every 3 seconds for real-time feel
+      return () => clearInterval(interval);
+    }
+  }, [isConnected, contractAddress, fhevmStatus, loadContractData, ethereumProvider]);
+
+  // Update time remaining immediately when poolData changes
+  useEffect(() => {
+    updateTimeRemaining();
+  }, [updateTimeRemaining]);
+
+  // Update time remaining every second when pool has started
+  useEffect(() => {
+    if (poolData && poolData.startTime > 0n && poolData.endTime > 0n) {
+      const interval = setInterval(() => {
+        updateTimeRemaining();
+      }, 1000);
+      return () => clearInterval(interval);
+    }
+  }, [poolData, updateTimeRemaining]);
+
+
+  const loadMazaTokenData = useCallback(async (tokenAddress: string, userAddress: string, contractAddress: string, isInitialLoad: boolean = false) => {
+    // Only show loading spinner on initial load (first time only)
+    const shouldShowLoading = isInitialLoad && !hasLoadedBalanceOnce;
+    
+    try {
+      if (shouldShowLoading) {
+        setIsLoadingBalance(true);
+      }
+      
+      const ethereum = ethereumProvider || (window as any).ethereum;
+      if (!ethereum) {
+        if (shouldShowLoading) {
+          setIsLoadingBalance(false);
+          setHasLoadedBalanceOnce(true);
+        }
+        return;
+      }
+      
+      const provider = new ethers.BrowserProvider(ethereum);
+      const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
+
+      const balance = await tokenContract.balanceOf(userAddress);
+      const allowance = await tokenContract.allowance(userAddress, contractAddress);
+      const decimals = await tokenContract.decimals();
+
+      setMazaBalance(ethers.formatUnits(balance, decimals));
+      setMazaAllowance(ethers.formatUnits(allowance, decimals));
+      
+      // Mark as loaded after successful fetch
+      if (isInitialLoad) {
+        setHasLoadedBalanceOnce(true);
+      }
+    } catch (error: any) {
+      // Silently handle errors - balance will remain at 0
+      if (isInitialLoad) {
+        setHasLoadedBalanceOnce(true); // Mark as attempted even on error
+    }
+    } finally {
+      // Only clear loading if we showed it
+      if (shouldShowLoading) {
+        setIsLoadingBalance(false);
+      }
+    }
+  }, [hasLoadedBalanceOnce, ethereumProvider]);
+
+  // Reset balance loading state when account changes (wallet switch)
+  useEffect(() => {
+    if (account !== previousAccountRef.current) {
+      // Account changed - reset balance state and reload
+      if (previousAccountRef.current !== undefined) {
+        // This is a wallet switch, not initial load
+        setHasLoadedBalanceOnce(false);
+        setMazaBalance('0');
+        setMazaAllowance('0');
+        setIsLoadingBalance(true);
+      }
+      previousAccountRef.current = account;
+    }
+  }, [account]);
+
+  // Load balance on initial mount or when account changes (after token address is known)
+  useEffect(() => {
+    if (isConnected && contractAddress && mazaTokenAddress && account && !hasLoadedBalanceOnce) {
+      loadMazaTokenData(mazaTokenAddress, account, contractAddress, true);
+    }
+  }, [isConnected, contractAddress, mazaTokenAddress, account, hasLoadedBalanceOnce, loadMazaTokenData]);
+
+  // Periodic balance refresh every 10 seconds
+  useEffect(() => {
+    if (!isConnected || !contractAddress || !mazaTokenAddress || !account) {
+      return;
+    }
+
+    // Refresh balance periodically
+    const balanceInterval = setInterval(() => {
+      loadMazaTokenData(mazaTokenAddress, account, contractAddress, false);
+    }, 10000); // Every 10 seconds
+
+    return () => clearInterval(balanceInterval);
+  }, [isConnected, contractAddress, mazaTokenAddress, account, loadMazaTokenData]);
+
+  // Listen for Transfer and Approval events to update balance/allowance in real-time
+  useEffect(() => {
+    if (!isConnected || !mazaTokenAddress || !account || !ethereumProvider) {
+      return;
+    }
+
+    let tokenContract: ethers.Contract | null = null;
+    let transferListenerRef: any = null;
+    let approvalListenerRef: any = null;
+
+    const setupEventListeners = async () => {
+      try {
+        const provider = new ethers.BrowserProvider(ethereumProvider);
+        tokenContract = new ethers.Contract(mazaTokenAddress, ERC20_ABI, provider);
+        
+        const handleTransfer = async () => {
+          // Refresh balance when transfer occurs
+          if (contractAddress) {
+            await loadMazaTokenData(mazaTokenAddress, account, contractAddress, false);
+          }
+        };
+
+        const handleApproval = async () => {
+          // Refresh allowance when approval occurs
+          if (contractAddress) {
+            await loadMazaTokenData(mazaTokenAddress, account, contractAddress, false);
+          }
+        };
+
+        // Listen for Transfer events involving the current account
+        // Handle both incoming (to == account) and outgoing (from == account) transfers
+        const transferEventHandler = (from: string, to: string) => {
+          const fromLower = from.toLowerCase();
+          const toLower = to.toLowerCase();
+          const accountLower = account.toLowerCase();
+          
+          // Refresh balance if transfer involves the current account
+          if (fromLower === accountLower || toLower === accountLower) {
+            handleTransfer();
+          }
+        };
+        
+        // Listen for Approval events for the current account
+        const approvalEventHandler = (owner: string) => {
+          if (owner.toLowerCase() === account.toLowerCase()) {
+            handleApproval();
+          }
+        };
+
+        // Set up event listeners using the contract's event interface
+        tokenContract.on('Transfer', transferEventHandler);
+        tokenContract.on('Approval', approvalEventHandler);
+        
+        transferListenerRef = { 
+          eventName: 'Transfer', 
+          listener: transferEventHandler
+        };
+        approvalListenerRef = { 
+          eventName: 'Approval', 
+          listener: approvalEventHandler 
+        };
+      } catch (error) {
+        // Silently handle errors - event listener setup might fail
+        console.error('Failed to setup event listeners:', error);
+      }
+    };
+
+    setupEventListeners();
+
+    return () => {
+      if (tokenContract) {
+        try {
+          if (transferListenerRef) {
+            tokenContract.off('Transfer', transferListenerRef.listener);
+          }
+          if (approvalListenerRef) {
+            tokenContract.off('Approval', approvalListenerRef.listener);
+          }
+        } catch (error) {
+          // Ignore cleanup errors
+        }
+      }
+    };
+  }, [isConnected, mazaTokenAddress, account, contractAddress, ethereumProvider, loadMazaTokenData]);
+
+  const loadWinners = async (poolId: number, contract: ethers.Contract) => {
+    try {
+      const winnersData = await contract.getPoolWinners(poolId);
+      const winnersList: WinnerData[] = winnersData[0].map((addr: string, idx: number) => ({
+        address: addr,
+        percentage: winnersData[1][idx],
+        reward: winnersData[2][idx],
+        claimed: winnersData[3][idx],
+      }));
+      setWinners(winnersList);
+    } catch (error: any) {
+      // Silently handle errors
+    }
+  };
+
+  const checkUserWinnerStatus = async (poolId: number, contract: ethers.Contract) => {
+    try {
+      const result = await contract.isWinner(poolId, account);
+      setUserWinnerInfo({
+        isWinner: result[0],
+        reward: result[1],
+        claimed: result[2],
+      });
+    } catch (error: any) {
+      // Silently handle errors
+    }
+  };
+
+  const loadPastPools = async (currentPoolId: number, contract: ethers.Contract, showLoading: boolean = false) => {
+    try {
+      if (showLoading) {
+        setIsLoadingDrawnPools(true);
+      }
+      
+      // Load last 10 pools
+      const startId = Math.max(0, currentPoolId - 10);
+      const poolIds = Array.from({ length: currentPoolId - startId }, (_, i) => startId + i);
+      
+      // Step 1: Load all pool basic data in parallel
+      const poolPromises = poolIds.map(async (poolId) => {
+        try {
+          const pool = await contract.getPool(poolId);
+          return {
+            poolId,
+            pool,
+            success: true,
+          };
+        } catch (error) {
+          return { poolId, pool: null, success: false };
+        }
+      });
+      
+      const poolResults = await Promise.all(poolPromises);
+      
+      // Step 2: Load data for pools with winners AND pools that are closed but not drawn
+      const poolsWithWinners = poolResults.filter(
+        (result) => result.success && result.pool && result.pool.winnersDrawn
+      );
+      
+      // Also check for pools that are closed but not drawn (need to check if indices are generated)
+      const poolsNotDrawn = poolResults.filter(
+        (result) => result.success && result.pool && result.pool.isClosed && !result.pool.winnersDrawn && result.pool.totalEntries >= 5n
+      );
+      
+      // Check indicesGenerated for pools not drawn
+      const indicesPromises = poolsNotDrawn.map(async (result) => {
+        try {
+          const indicesGenerated = await contract.indicesGenerated(result.poolId);
+          return {
+            poolId: result.poolId,
+            indicesGenerated,
+          };
+        } catch (error) {
+          return {
+            poolId: result.poolId,
+            indicesGenerated: false,
+          };
+        }
+      });
+      
+      const indicesResults = await Promise.all(indicesPromises);
+      
+      const winnersPromises = poolsWithWinners.map(async (result) => {
+        try {
+          const [winnersData, winnerIndexHandles, userWinnerResult] = await Promise.all([
+            contract.getPoolWinners(result.poolId),
+            contract.getWinnerIndexHandles(result.poolId).catch(() => null),
+            account ? contract.isWinner(result.poolId, account).catch(() => null) : Promise.resolve(null),
+          ]);
+          
+          return {
+            poolId: result.poolId,
+            winnersData,
+            winnerIndexHandles,
+            userWinnerResult,
+          };
+        } catch (error) {
+          return {
+            poolId: result.poolId,
+            winnersData: null,
+            winnerIndexHandles: null,
+            userWinnerResult: null,
+          };
+        }
+      });
+      
+      const winnersResults = await Promise.all(winnersPromises);
+      
+      // Step 3: Combine all data
+      const poolsMap = new Map<number, PastPoolData>();
+      
+      // Process all pools (with and without winners)
+      poolResults.forEach((result) => {
+        if (!result.success || !result.pool) return;
+        
+        const poolData: PastPoolData = {
+          poolId: result.poolId,
+          startTime: result.pool.startTime,
+          endTime: result.pool.endTime,
+          totalEntries: result.pool.totalEntries,
+          totalAmount: result.pool.totalAmount,
+          isClosed: result.pool.isClosed,
+          winnersDrawn: result.pool.winnersDrawn,
+          participantCount: result.pool.participantCount,
+        };
+        
+        poolsMap.set(result.poolId, poolData);
+      });
+      
+      // Add winners data to pools that have winners
+      winnersResults.forEach((winnersResult) => {
+        const poolData = poolsMap.get(winnersResult.poolId);
+        if (!poolData || !winnersResult.winnersData) return;
+        
+        poolData.winners = winnersResult.winnersData[0].map((addr: string, idx: number) => ({
+          address: addr,
+          percentage: winnersResult.winnersData[1][idx],
+          reward: winnersResult.winnersData[2][idx],
+          claimed: winnersResult.winnersData[3][idx],
+        }));
+        
+        if (winnersResult.winnerIndexHandles && winnersResult.winnerIndexHandles.length > 0) {
+          poolData.winnerIndexHandles = winnersResult.winnerIndexHandles.map((h: string) => ethers.hexlify(h));
+        }
+        
+        if (winnersResult.userWinnerResult) {
+          poolData.userWinnerInfo = {
+            isWinner: winnersResult.userWinnerResult[0],
+            reward: winnersResult.userWinnerResult[1],
+            claimed: winnersResult.userWinnerResult[2],
+          };
+        }
+      });
+      
+      // Add indicesGenerated info to pools not drawn
+      indicesResults.forEach((indicesResult) => {
+        const poolData = poolsMap.get(indicesResult.poolId);
+        if (poolData) {
+          poolData.indicesGenerated = indicesResult.indicesGenerated;
+        }
+      });
+      
+      // Convert map to array and sort by poolId (most recent first)
+      const pools = Array.from(poolsMap.values()).sort((a, b) => b.poolId - a.poolId);
+      
+      setPastPools(pools);
+      setHasLoadedDrawnPoolsOnce(true);
+    } catch (error: any) {
+      // Silently handle errors
+      setHasLoadedDrawnPoolsOnce(true); // Mark as attempted even on error
+    } finally {
+      if (showLoading) {
+        setIsLoadingDrawnPools(false);
+      }
+    }
+  };
+
+  const formatTime = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const formatDate = (timestamp: bigint): string => {
+    return new Date(Number(timestamp) * 1000).toLocaleString();
+  };
+
+  const handleApprove = async () => {
+    if (!mazaTokenAddress || !contractAddress) {
+      addToast('Token or contract address not loaded', 'error');
+      return;
+    }
+
+    const ethereum = ethereumProvider || (window as any).ethereum;
+    if (!ethereum) {
+      addToast('Wallet not connected. Please connect your wallet.', 'error');
+      return;
+    }
+
+    const toastId = addToast('Please sign the transaction in your wallet to approve MAZA tokens', 'loading', 0);
+
+    try {
+      setIsApproving(true);
+
+      const provider = new ethers.BrowserProvider(ethereum);
+      const signer = await provider.getSigner();
+      const tokenContract = new ethers.Contract(mazaTokenAddress, ERC20_ABI, signer);
+
+      // Approve maximum amount (one-time approval) - this allows unlimited spending
+      const approveAmount = ethers.MaxUint256;
+      updateToast(toastId, 'Transaction submitted. Waiting for confirmation...', 'info');
+      const tx = await tokenContract.approve(contractAddress, approveAmount);
+
+      updateToast(toastId, 'Transaction pending confirmation...', 'loading');
+      await tx.wait();
+
+      removeToast(toastId);
+      addToast('Approval successful! You can now enter the pool.', 'success');
+      
+      // Reload token data to update allowance (silent update, no loading spinner)
+      if (mazaTokenAddress && account && contractAddress) {
+        await loadMazaTokenData(mazaTokenAddress, account, contractAddress, false);
+      }
+      
+      // Also reload contract data to ensure pool state is fresh
+      await loadContractData();
+    } catch (error: any) {
+      removeToast(toastId);
+      const errorMessage = error?.message || error?.toString() || 'Unknown error';
+      if (errorMessage.includes('User rejected') || errorMessage.includes('user denied') || errorMessage.includes('rejected')) {
+        addToast('Transaction cancelled. You can try again when ready.', 'warning');
+      } else {
+        addToast(`Approval failed: ${errorMessage}`, 'error');
+      }
+    } finally {
+      setIsApproving(false);
+    }
+  };
+
+  const handleEnterPool = async () => {
+    if (!contractAddress) {
+      addToast('Contract address not configured', 'error');
+      return;
+    }
+
+    // Check if user has already entered
+    if (hasEnteredCurrentPool) {
+      addToast('You have already entered this pool. Each address can only enter once per pool.', 'error');
+      return;
+    }
+
+    const ethereum = ethereumProvider || (window as any).ethereum;
+    if (!ethereum) {
+      addToast('Wallet not connected. Please connect your wallet.', 'error');
+      return;
+    }
+
+    const toastId = addToast('Please sign the transaction in your wallet to enter the pool', 'loading', 0);
+
+    try {
+      setIsEntering(true);
+
+      const provider = new ethers.BrowserProvider(ethereum);
+      const signer = await provider.getSigner();
+      const contract = new ethers.Contract(contractAddress, RAFFLE_ABI, signer);
+
+      updateToast(toastId, 'Transaction submitted. Waiting for confirmation...', 'info');
+      const tx = await contract.enterPool();
+
+      updateToast(toastId, 'Transaction pending confirmation...', 'loading');
+      await tx.wait();
+
+      removeToast(toastId);
+      addToast('Successfully entered the pool! Good luck!', 'success');
+      
+      // Reload token data to update balance after entry fee is deducted
+      if (mazaTokenAddress && account && contractAddress) {
+        await loadMazaTokenData(mazaTokenAddress, account, contractAddress, false);
+      }
+      
+      await loadContractData();
+    } catch (error: any) {
+      removeToast(toastId);
+      const errorMessage = error?.message || error?.toString() || 'Unknown error';
+      const lowerErrorMessage = errorMessage.toLowerCase();
+      
+      if (lowerErrorMessage.includes('user rejected') || lowerErrorMessage.includes('user denied') || lowerErrorMessage.includes('rejected')) {
+        addToast('Transaction cancelled. You can try again when ready.', 'warning');
+      } else if (lowerErrorMessage.includes('already entered') || lowerErrorMessage.includes('already entered this pool')) {
+        addToast('You have already entered this pool. Each address can only enter once per pool.', 'error');
+        // Update state to reflect that user has entered
+        setHasEnteredCurrentPool(true);
+      } else {
+        addToast(`Failed to enter pool: ${errorMessage}`, 'error');
+      }
+    } finally {
+      setIsEntering(false);
+    }
+  };
+
+  // Automated draw winners flow (combines generateWinnerIndices and drawWinners)
+  // Uses proper FHE pattern: FHE.allow() instead of makePubliclyDecryptable
+  const handleDrawWinners = async (poolIdOrEvent?: number | React.MouseEvent) => {
+    // Handle case where event object is accidentally passed
+    if (poolIdOrEvent && typeof poolIdOrEvent !== 'number') {
+      console.warn('⚠️ Event object passed to handleDrawWinners, using currentPoolId instead');
+      poolIdOrEvent = undefined;
+    }
+    const targetPoolId = (poolIdOrEvent !== undefined && typeof poolIdOrEvent === 'number') ? poolIdOrEvent : currentPoolId;
+    
+    if (!contractAddress) {
+      addToast('Contract address not configured', 'error');
+      return;
+    }
+    
+    if (!isOwner) {
+      addToast('Only owner can draw winners', 'error');
+      return;
+    }
+
+    if (fhevmStatus !== 'ready') {
+      addToast('FHEVM not ready. Please wait...', 'warning');
+      return;
+    }
+
+    const toastId = addToast('Starting winner draw process...', 'loading', 0);
+
+    try {
+      setIsDrawingWinners(true);
+      const ethereum = ethereumProvider || (window as any).ethereum;
+      if (!ethereum) {
+        addToast('Wallet not connected. Please connect your wallet.', 'error');
+        return;
+      }
+      
+      const provider = new ethers.BrowserProvider(ethereum);
+      const signer = await provider.getSigner();
+      const contract = new ethers.Contract(contractAddress, RAFFLE_ABI, signer);
+
+      // Check if indices are already generated
+      const indicesGenerated = await contract.indicesGenerated(targetPoolId);
+      
+      // Step 1: Generate encrypted winner indices (if not already generated)
+      if (!indicesGenerated) {
+        updateToast(toastId, 'Step 1/3: Please sign to generate encrypted winner indices', 'loading');
+        const generateTx = await contract.generateWinnerIndices(targetPoolId);
+        
+        updateToast(toastId, 'Step 1/3: Transaction submitted. Waiting for confirmation...', 'info');
+        await generateTx.wait();
+      } else {
+        updateToast(toastId, 'Indices already generated, proceeding to decryption...', 'info');
+      }
+
+      // Step 2: Get handles from contract (now returns bytes32[] for 5 winner indices)
+      updateToast(toastId, 'Step 2/3: Fetching encrypted winner indices...', 'loading');
+      const handles: string[] = await contract.getWinnerIndexHandles(targetPoolId);
+      
+      if (!handles || handles.length === 0) {
+        throw new Error('Winner index handles not found');
+      }
+
+      // Step 3: Batch decrypt all handles with ONE EIP-712 signature (much better UX!)
+      updateToast(toastId, `Step 2/3: Batch decrypting ${handles.length} winner indices (please sign EIP-712 once)...`, 'loading');
+      
+      // Ensure FHE instance is ready before decrypting
+      if (fhevmStatus !== 'ready') {
+        throw new Error('FHEVM not initialized. Please wait for initialization to complete.');
+      }
+      
+      // Use batch userDecrypt - only ONE EIP-712 signature needed for all handles!
+      let decryptedIndices;
+      try {
+        decryptedIndices = await userDecryptBatch(handles, contractAddress, signer);
+        console.log('Decrypted winner indices:', decryptedIndices);
+      } catch (decryptError: any) {
+        // Re-throw with more context if it's a decryption-specific error
+        const errorMsg = decryptError?.message || decryptError?.toString() || 'Unknown decryption error';
+        console.error('❌ Batch decryption failed:', decryptError);
+        throw new Error(`Failed to decrypt winner indices: ${errorMsg}`);
+      }
+
+      // Step 4: Submit drawWinners transaction with decrypted indices
+      updateToast(toastId, 'Step 3/3: Please sign to submit decrypted indices and draw winners', 'loading');
+      const drawTx = await contract.drawWinners(targetPoolId, decryptedIndices);
+
+      updateToast(toastId, 'Step 3/3: Transaction submitted. Waiting for confirmation...', 'info');
+      await drawTx.wait();
+
+      // Load winners immediately
+      await loadWinners(targetPoolId, contract);
+      
+      // Start animation
+      setShowDrawAnimation(true);
+      
+      removeToast(toastId);
+      addToast('Winners drawn successfully!', 'success');
+      
+      // Reload all contract data after animation
+      await loadContractData();
+      
+      // If drawing a past pool, reload past pools to update UI
+      if (poolIdOrEvent !== undefined && typeof poolIdOrEvent === 'number' && poolIdOrEvent !== currentPoolId) {
+        await loadPastPools(currentPoolId, contract, false);
+      }
+    } catch (error: any) {
+      removeToast(toastId);
+      const errorMessage = error?.message || error?.toString() || 'Unknown error';
+      const lowerErrorMessage = errorMessage.toLowerCase();
+      
+      // Log the actual error for debugging
+      console.error('❌ Draw winners error:', error);
+      console.error('❌ Error message:', errorMessage);
+      
+      if (lowerErrorMessage.includes('user rejected') || lowerErrorMessage.includes('user denied') || lowerErrorMessage.includes('rejected')) {
+        addToast('Transaction cancelled. You can try again when ready.', 'warning');
+      } else if (lowerErrorMessage.includes('fhe instance not initialized') || lowerErrorMessage.includes('fhevm not initialized')) {
+        addToast('FHEVM not ready. Please wait for initialization or refresh the page.', 'error');
+        console.error('FHEVM initialization issue:', error);
+      } else if (lowerErrorMessage.includes('insufficient funds') || 
+                 (lowerErrorMessage.includes('insufficient') && lowerErrorMessage.includes('eth'))) {
+        // Only show balance error if it's actually about ETH balance (gas)
+        addToast('Insufficient ETH for gas fees. Please add ETH to your wallet.', 'error');
+      } else if (lowerErrorMessage.includes('pool must be closed') || lowerErrorMessage.includes('pool is not closed')) {
+        addToast('Pool must be closed before drawing winners.', 'error');
+      } else if (lowerErrorMessage.includes('winners already drawn')) {
+        addToast('Winners have already been drawn for this pool.', 'error');
+      } else if (lowerErrorMessage.includes('indices not generated')) {
+        addToast('Winner indices must be generated first. Please try again.', 'error');
+      } else if (lowerErrorMessage.includes('not enough participants')) {
+        addToast('Not enough participants to draw winners. Need at least 5 entries.', 'error');
+      } else if (lowerErrorMessage.includes('invalid indices count')) {
+        addToast('Invalid number of winner indices. Expected 5 indices.', 'error');
+      } else {
+        // Show the actual error message (Toast component will format it)
+        addToast(`Failed to draw winners: ${errorMessage.substring(0, 200)}`, 'error');
+      }
+    } finally {
+      setIsDrawingWinners(false);
+    }
+  };
+
+  const handleClaimReward = async (poolId: number) => {
+    if (!contractAddress) {
+      addToast('Contract address not configured', 'error');
+      return;
+    }
+
+    const toastId = addToast('Please sign the transaction in your wallet to claim reward', 'loading', 0);
+
+    try {
+      setIsClaiming(true);
+      const ethereum = ethereumProvider || (window as any).ethereum;
+      if (!ethereum) {
+        addToast('Wallet not connected. Please connect your wallet.', 'error');
+        return;
+      }
+
+      const provider = new ethers.BrowserProvider(ethereum);
+      const signer = await provider.getSigner();
+      const contract = new ethers.Contract(contractAddress, RAFFLE_ABI, signer);
+
+      updateToast(toastId, 'Transaction submitted. Waiting for confirmation...', 'info');
+      const tx = await contract.claimReward(poolId);
+
+      updateToast(toastId, 'Transaction pending confirmation...', 'loading');
+      await tx.wait();
+
+      removeToast(toastId);
+      addToast('Reward claimed successfully! Check your wallet balance.', 'success');
+      
+      // Show confetti celebration
+      setShowClaimConfetti(true);
+      
+      await loadContractData();
+    } catch (error: any) {
+      removeToast(toastId);
+      const errorMessage = error?.message || error?.toString() || 'Unknown error';
+      if (errorMessage.includes('User rejected') || errorMessage.includes('user denied') || errorMessage.includes('rejected')) {
+        addToast('Transaction cancelled. You can try again when ready.', 'warning');
+      } else {
+        addToast(`Failed to claim reward: ${errorMessage}`, 'error');
+      }
+    } finally {
+      setIsClaiming(false);
+    }
+  };
+
+  // Show helpful message if contract address is not configured, but still show the UI structure
+  const contractNotConfigured = !CONTRACT_ADDRESS || CONTRACT_ADDRESS === '';
+
+  // Check if approval is needed - MaxUint256 approval means unlimited
+  // If allowance is a very large number (like MaxUint256 formatted), consider it approved
+  const allowanceValue = parseFloat(mazaAllowance);
+  const entryFeeValue = parseFloat(entryFee);
+  // MaxUint256 (2^256 - 1) formatted with 18 decimals would be ~1.15e+59, so anything > 1e+50 is effectively infinite
+  const isUnlimitedApproval = allowanceValue > 1e50 || allowanceValue === Infinity;
+  const needsApproval = !isUnlimitedApproval && (allowanceValue < entryFeeValue || allowanceValue === 0 || isNaN(allowanceValue));
+  // Don't show insufficient balance if we haven't loaded the balance yet
+  const hasEnoughBalance = hasLoadedBalanceOnce
+    ? parseFloat(mazaBalance) >= parseFloat(entryFee)
+    : true;
+
+  // --- Stats bar data for header ---
+  const totalVolumeDrawn = pastPools.length
+    ? `${ethers.formatEther(
+        pastPools.reduce((sum, pool) => sum + pool.totalAmount, 0n),
+      )} MAZA`
+    : "0 MAZA";
+
+  let statusLabel = "Not Connected";
+  let statusColorClassName = "text-gray-600";
+
+  if (poolData) {
+    if (poolData.startTime === 0n) {
+      statusLabel = "Waiting";
+      statusColorClassName = "text-gray-600";
+    } else if (poolData.winnersDrawn) {
+      statusLabel = "Completed";
+      statusColorClassName = "text-red-600";
+    } else if (timeRemaining > 0) {
+      statusLabel = "Active";
+      statusColorClassName = "text-green-600";
+    } else if (timeRemaining === 0 && poolData.startTime > 0n) {
+      statusLabel = "Ended";
+      statusColorClassName = "text-maza-pink";
+    }
+  }
+
+  const statsBarItems = [
+    {
+      label: "Pool ID",
+      value: `#${currentPoolId}`,
+      valueColorClassName: "text-black",
+    },
+    {
+      label: "Total Entries",
+      value: poolData?.totalEntries.toString() ?? "0",
+      valueColorClassName: "text-black",
+    },
+    {
+      label: "Pool Amount",
+      value: poolData ? `${ethers.formatEther(poolData.totalAmount)} MAZA` : "0",
+      valueColorClassName: "text-maza-pink",
+    },
+    {
+      label: "Total Volume Drawn",
+      value: totalVolumeDrawn,
+      valueColorClassName: "text-maza-blue",
+    },
+    {
+      label: "Status",
+      value: statusLabel,
+      valueColorClassName: statusColorClassName,
+    },
+  ];
+
+  return (
+    <>
+      <ToastContainer toasts={toasts} onRemove={removeToast} />
+      
+      {/* Raffle Draw Animation */}
+      {showDrawAnimation && winners.length > 0 && (
+        <RaffleDrawAnimation
+          participantAddresses={participantAddresses.length > 0 ? participantAddresses : winners.map(w => w.address)}
+          winners={winners}
+          isAnimating={showDrawAnimation}
+          onAnimationComplete={() => {
+            setShowDrawAnimation(false);
+            loadContractData();
+          }}
+        />
+      )}
+      
+      {/* Claim Confetti */}
+      <ClaimConfetti
+        key={showClaimConfetti ? Date.now() : 0}
+        show={showClaimConfetti}
+        onComplete={() => setShowClaimConfetti(false)}
+      />
+      
+      <div className="w-full max-w-[1400px] mx-auto min-h-screen bg-maza-cream p-4 md:p-8 space-y-6 md:space-y-8">
+        {/* Contract Configuration Warning */}
+        {contractNotConfigured && (
+          <div className="bg-maza-cream border-2 border-black rounded-lg p-6 md:p-8 shadow-neo">
+            <div className="flex items-start gap-4">
+              <div className="text-4xl">⚠️</div>
+              <div className="flex-1">
+                <h3 className="text-black font-black text-lg md:text-2xl mb-3 uppercase">
+                  Contract Address Not Configured
+                </h3>
+                <p className="text-black text-sm md:text-lg mb-4 md:mb-6 font-bold">
+                  The Raffle contract address is not set for this network. You need to configure it to use the app.
+                </p>
+                <div className="bg-white border-2 border-black rounded-lg p-4 md:p-6 mb-4 shadow-neo">
+                  <p className="text-black text-sm md:text-lg mb-3 font-black">
+                    To fix this:
+                  </p>
+                  <ol className="list-decimal list-inside space-y-2 text-black text-xs md:text-base font-bold">
+                    <li>
+                      Create a{" "}
+                      <code className="bg-maza-cream border-2 border-black px-2 py-1 rounded font-mono">
+                        .env
+                      </code>{" "}
+                      file in the Raffle directory
+                    </li>
+                    <li>
+                      Add:{" "}
+                      <code className="bg-maza-cream border-2 border-black px-2 py-1 rounded font-mono">
+                        VITE_RAFFLE_CONTRACT_ADDRESS_SEPOLIA=0x...
+                      </code>
+                    </li>
+                    <li>Restart your dev server</li>
+                  </ol>
+                </div>
+                <p className="text-black text-xs md:text-base mt-4 font-bold">
+                  Current Chain ID: {chainId} | Expected: 11155111 (Sepolia)
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Header */}
+        <Card backgroundClassName="bg-maza-cream">
+          <div className="mb-4 flex items-center gap-3 md:gap-5">
+            <Trophy className="h-8 w-8 text-black md:h-10 md:w-10" />
+            <h2 className="text-2xl font-black uppercase tracking-tight text-black md:text-4xl">
+              FHE Raffle Pool
+            </h2>
+          </div>
+          {isLoadingPoolData ? (
+            <div className="grid grid-cols-2 gap-4 md:grid-cols-5 md:gap-8">
+              {Array.from({ length: 5 }).map((_, idx) => (
+                <div key={`skeleton-${idx}`}>
+                  <div className="mb-2 h-4 w-20 animate-pulse rounded bg-gray-300 md:h-5" />
+                  <div className="h-6 w-16 animate-pulse rounded bg-gray-300 md:h-8 md:w-24" />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <RaffleStatsBar stats={statsBarItems} />
+          )}
+        </Card>
+
+        {/* Countdown Timer - Show when pool has started (has entries) and countdown is active */}
+        {poolData && poolData.startTime > 0n && poolData.totalEntries > 0n && timeRemaining > 0 && (
+          <div className="bg-white border-2 border-black rounded-lg p-6 md:p-10 shadow-neo">
+            <div className="flex items-center justify-center gap-3 md:gap-5 mb-4 md:mb-6">
+              <Clock className="w-6 h-6 md:w-8 md:h-8 text-black" />
+              <p className="text-black text-lg md:text-2xl font-black">
+                Time Remaining
+              </p>
+            </div>
+            <p className="text-5xl md:text-7xl font-black text-black text-center">
+              {formatTime(timeRemaining)}
+            </p>
+          </div>
+        )}
+        
+        {/* Countdown Ended - Show when countdown reaches 0 */}
+        {poolData && poolData.startTime > 0n && poolData.totalEntries > 0n && timeRemaining === 0 && (
+          <div className="bg-maza-cream border-2 border-black rounded-lg p-6 md:p-10 shadow-neo">
+            <div className="flex items-center justify-center gap-3 md:gap-5 mb-4 md:mb-6">
+              <Clock className="w-6 h-6 md:w-8 md:h-8 text-black" />
+              <p className="text-black text-lg md:text-2xl font-black">
+                Countdown Ended
+              </p>
+            </div>
+            <p className="text-5xl md:text-7xl font-black text-black text-center">
+              00:00
+            </p>
+            <p className="text-black text-sm md:text-lg text-center mt-4 md:mt-6 font-black">
+              Pool is now closed. No more entries allowed.
+            </p>
+          </div>
+        )}
+
+        {/* Waiting for first entry message - Show when pool hasn't started yet */}
+        {poolData && poolData.startTime === 0n && poolData.totalEntries === 0n && (
+          <div className="bg-white border-2 border-black rounded-lg p-6 md:p-10 shadow-neo">
+            <div className="flex items-center gap-3 md:gap-5 mb-4 md:mb-6">
+              <Users className="w-6 h-6 md:w-8 md:h-8 text-black" />
+              <p className="text-black text-lg md:text-2xl font-black">
+                Pool Status
+              </p>
+              </div>
+            <p className="text-2xl md:text-4xl font-black text-black mb-3 md:mb-4">
+              Waiting for first entry
+            </p>
+            <p className="text-gray-700 text-base md:text-xl font-bold">The 5-minute timer will start when someone enters the pool</p>
+          </div>
+        )}
+
+        {/* Pool Ended Message - Only show when countdown is exactly 00:00 and winners not drawn */}
+        {poolData && poolData.startTime > 0n && timeRemaining === 0 && !poolData.winnersDrawn && (
+          <div className="bg-maza-cream border-2 border-black rounded-lg p-6 md:p-8 shadow-neo">
+            <div className="flex items-center gap-3 md:gap-5">
+              <Clock className="w-6 h-6 md:w-8 md:h-8 text-black" />
+              <div className="flex-1">
+                <p className="text-black font-black text-lg md:text-2xl mb-2 md:mb-3">
+                  Pool Ended - Awaiting Draw
+                </p>
+                <p className="text-black text-sm md:text-lg font-bold">
+                  {poolData.totalEntries > 0n 
+                    ? `Countdown ended. ${Number(poolData.totalEntries)} participant${Number(poolData.totalEntries) !== 1 ? 's' : ''} entered. Owner can now draw winners.`
+                    : 'No participants. Pool will be reset.'
+                  }
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Entry Section and Past Pools - Horizontal Layout on Desktop */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 md:gap-8">
+          {/* Entry Section - Prominent Design - Show when pool hasn't started, is active (countdown > 0), or pending draw */}
+          {poolData && (poolData.startTime === 0n || timeRemaining > 0 || (timeRemaining === 0 && !poolData.winnersDrawn)) && (
+            <div className="bg-white border-2 border-black rounded-lg p-6 md:p-10 shadow-neo transform hover:-translate-y-1 transition-transform">
+              {/* Header */}
+              <div className="flex items-center gap-3 md:gap-5 mb-6 md:mb-8">
+                <div className="w-16 h-16 md:w-20 md:h-24 bg-maza-pink border-2 border-black rounded-lg flex items-center justify-center shadow-neo">
+                  <Ticket className="w-8 h-8 md:w-12 md:h-12 text-black" />
+                </div>
+                <div>
+                  <h3 className="text-2xl md:text-4xl font-black text-black uppercase">
+                    Enter Raffle Pool
+                  </h3>
+                  <p className="text-gray-700 text-base md:text-xl font-black">Join now and win big!</p>
+                </div>
+              </div>
+
+              {/* Entry Fee Display - Large and Prominent */}
+              <div className="bg-maza-cream border-2 border-black rounded-lg p-6 md:p-8 mb-6 md:mb-8 shadow-neo">
+                <div className="flex items-center justify-between mb-6 md:mb-8">
+                  <span className="text-black text-lg md:text-2xl font-black">
+                    Entry Fee
+                  </span>
+                  <div className="text-right">
+                    <span className="text-4xl md:text-6xl font-black text-maza-pink">
+                      {entryFee || '5'}
+                    </span>
+                    <span className="text-2xl md:text-4xl font-black text-black ml-2">
+                      MAZA
+                    </span>
+                  </div>
+                </div>
+                <div className="h-1 bg-black my-6 md:my-8"></div>
+                <div className="flex items-center justify-between">
+                  <span className="text-black text-lg md:text-2xl font-black">
+                    Your Balance
+                  </span>
+                  <div className="flex items-center gap-2 md:gap-4">
+                    {isLoadingBalance ? (
+                  <div className="flex items-center gap-2">
+                        <Loader2 className="w-5 h-5 md:w-6 md:h-6 animate-spin text-black" />
+                        <span className="text-black text-lg md:text-xl font-bold">
+                          Loading...
+                        </span>
+                      </div>
+                    ) : (
+                      <>
+                        <span className={`text-2xl md:text-4xl font-black ${hasEnoughBalance ? 'text-green-600' : 'text-red-600'}`}>
+                      {mazaBalance}
+                    </span>
+                        <span className="text-xl md:text-3xl font-black text-black">
+                          MAZA
+                        </span>
+                    {!hasEnoughBalance && (
+                          <span className="text-sm md:text-base text-red-600 bg-red-100 border-2 border-black px-3 md:px-4 py-1 md:py-2 rounded font-black">
+                            Insufficient
+                          </span>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Button - Large and Prominent */}
+              {!contractAddress ? (
+                <button
+                  disabled
+                  className="w-full bg-gray-300 text-gray-600 font-black py-4 md:py-6 rounded-lg border-2 border-black opacity-50 cursor-not-allowed text-lg md:text-xl"
+                >
+                  <span className="flex items-center justify-center gap-3 md:gap-4">
+                    <Loader2 className="w-6 h-6 md:w-8 md:h-8 animate-spin" />
+                    Waiting for Contract Configuration
+                  </span>
+                </button>
+              ) : needsApproval ? (
+                <button
+                  onClick={handleApprove}
+                  disabled={isApproving || !hasEnoughBalance || !contractAddress || !mazaTokenAddress}
+                  className="w-full bg-maza-pink text-black font-black py-4 md:py-6 rounded-lg border-2 border-black shadow-neo hover:shadow-neo-hover hover:-translate-y-1 hover:-translate-x-1 disabled:opacity-50 disabled:cursor-not-allowed text-lg md:text-xl transition-all duration-200"
+                >
+                  <span className="flex items-center justify-center gap-3 md:gap-4">
+                    {isApproving ? (
+                      <>
+                        <Loader2 className="w-6 h-6 md:w-8 md:h-8 animate-spin" />
+                        Approving...
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle2 className="w-6 h-6 md:w-8 md:h-8" />
+                        Approve MAZA (One-time)
+                      </>
+                    )}
+                  </span>
+                </button>
+              ) : (
+                <button
+                  onClick={handleEnterPool}
+                  disabled={isEntering || !hasEnoughBalance || !contractAddress || !mazaTokenAddress || (poolData && poolData.startTime > 0n && timeRemaining <= 0) || hasEnteredCurrentPool}
+                  className="w-full bg-black text-maza-cream font-black py-4 md:py-6 rounded-lg border-2 border-white shadow-neo hover:shadow-neo-hover hover:-translate-y-1 hover:-translate-x-1 disabled:opacity-50 disabled:cursor-not-allowed text-lg md:text-xl transition-all duration-200"
+                >
+                  <span className="flex items-center justify-center gap-3 md:gap-4">
+                    {hasEnteredCurrentPool && poolData && poolData.startTime > 0n && timeRemaining === 0 && !poolData.winnersDrawn ? (
+                      <>
+                        <Clock className="w-6 h-6 md:w-8 md:h-8" />
+                        Pending Draw
+                      </>
+                    ) : hasEnteredCurrentPool ? (
+                      <>
+                        <CheckCircle2 className="w-6 h-6 md:w-8 md:h-8" />
+                        Already Entered
+                      </>
+                    ) : isEntering ? (
+                      <>
+                        <Loader2 className="w-6 h-6 md:w-8 md:h-8 animate-spin" />
+                        Entering Pool...
+                      </>
+                    ) : (
+                      <>
+                        <Ticket className="w-6 h-6 md:w-8 md:h-8" />
+                        Enter Pool Now
+                      </>
+                    )}
+                  </span>
+                </button>
+              )}
+
+              {/* Info Text */}
+              <p className="text-center text-gray-700 text-sm md:text-base mt-6 md:mt-8 font-black">
+                {!contractAddress 
+                  ? "Configure contract address to enter the raffle pool"
+                  : !poolData 
+                    ? "Loading pool data..."
+                    : hasEnteredCurrentPool && poolData.startTime > 0n && timeRemaining === 0 && !poolData.winnersDrawn
+                      ? "Pool countdown has ended. Waiting for owner to draw winners."
+                    : hasEnteredCurrentPool
+                      ? "You have already entered this pool. Each address can only enter once per pool."
+                    : needsApproval
+                      ? "Approve MAZA tokens once to enable unlimited entries (no need to approve again)"
+                    : poolData.startTime > 0n && timeRemaining <= 0
+                      ? "Countdown has ended. Pool is closed. No more entries allowed."
+                    : hasEnoughBalance 
+                        ? "Click the button above to enter the raffle pool" 
+                        : "You need more MAZA tokens to enter this pool"}
+              </p>
+          </div>
+        )}
+
+          {/* Past Pools Section */}
+          <div className="bg-white border-2 border-black rounded-lg p-6 md:p-10 shadow-neo transform hover:-translate-y-1 transition-transform">
+            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-6">
+              <div className="flex items-center gap-3">
+                <Trophy className="w-6 h-6 md:w-8 md:h-8 text-black" />
+                <h3 className="text-xl md:text-3xl font-black text-black uppercase">
+                  Drawn Pools
+                </h3>
+            </div>
+                <button
+                onClick={async () => {
+                  const newShowState = !showPastPools;
+                  setShowPastPools(newShowState);
+                  
+                  // Load pools when showing for the first time
+                  if (newShowState && pastPools.length === 0 && contractAddress && currentPoolId > 0) {
+                    try {
+                      const ethereum = ethereumProvider || (window as any).ethereum;
+                      if (ethereum) {
+                        const provider = new ethers.BrowserProvider(ethereum);
+                        const contract = new ethers.Contract(contractAddress, RAFFLE_ABI, provider);
+                        await loadPastPools(currentPoolId, contract, !hasLoadedDrawnPoolsOnce);
+                      }
+                    } catch (error) {
+                      // Silently handle errors
+                      setHasLoadedDrawnPoolsOnce(true); // Mark as attempted even on error
+                    }
+                  }
+                }}
+                className="text-black text-sm md:text-lg font-black hover:underline border-2 border-black px-3 md:px-4 py-2 rounded-lg bg-maza-cream hover:bg-maza-pink transition-colors"
+                >
+                {showPastPools ? 'Hide' : 'Show'}
+                </button>
+                </div>
+            {showPastPools && (
+              <div className="space-y-3 md:space-y-4 max-h-[500px] md:max-h-[600px] overflow-y-auto">
+                {isLoadingDrawnPools && !hasLoadedDrawnPoolsOnce ? (
+                  // Skeleton Loaders - Only show on initial load
+                  Array.from({ length: 3 }).map((_, idx) => (
+                    <div key={`skeleton-${idx}`} className="bg-maza-cream rounded-lg border-2 border-black animate-pulse">
+                      <div className="p-3 md:p-4">
+                        <div className="flex justify-between items-start mb-2">
+                          <div className="flex-1">
+                            <div className="h-5 md:h-6 bg-gray-300 rounded w-24 mb-2"></div>
+                            <div className="h-4 bg-gray-300 rounded w-32"></div>
+            </div>
+                          <div className="text-right ml-4">
+                            <div className="h-5 md:h-6 bg-gray-300 rounded w-20 mb-2"></div>
+                            <div className="h-4 bg-gray-300 rounded w-16"></div>
+          </div>
+            </div>
+          </div>
+                    </div>
+                  ))
+                ) : pastPools.length === 0 ? (
+                  <p className="text-gray-600 text-center text-sm md:text-lg font-bold">No drawn pools yet</p>
+              ) : (
+                pastPools.map((pool) => {
+                  const isExpanded = expandedPoolId === pool.poolId;
+                  const hasWinners = pool.winnersDrawn && pool.winners && pool.winners.length > 0;
+                  const poolWinners = pool.winners || [];
+                  
+                  return (
+                      <div key={pool.poolId} className="bg-maza-cream rounded-lg border-2 border-black hover:border-black transition-colors">
+                      {/* Pool Header - Clickable */}
+                      <button
+                        onClick={() => setExpandedPoolId(isExpanded ? null : pool.poolId)}
+                          className="w-full p-3 md:p-4 flex justify-between items-start hover:bg-maza-pink/60 transition-colors rounded-lg"
+                      >
+                        <div className="flex-1 text-left">
+                            <div className="flex flex-wrap items-center gap-2 md:gap-3 mb-2">
+                              <p className="text-black font-black text-base md:text-xl">
+                                Pool #{pool.poolId}
+                              </p>
+                            {hasWinners && (
+                                <span className="px-2 md:px-3 py-1 bg-maza-green text-black text-xs rounded-lg border-2 border-black font-black">
+                                {poolWinners.length} Winners
+                              </span>
+                            )}
+                            {account && pool.userWinnerInfo?.isWinner && (
+                              <span className="px-2 md:px-3 py-1 bg-black text-maza-cream text-xs rounded-lg border-2 border-white font-black flex items-center gap-1">
+                                <Crown className="w-3 h-3 md:w-4 md:h-4" />
+                                You Won!
+                              </span>
+                            )}
+                          </div>
+                            <p className="text-gray-700 text-xs md:text-base font-bold">{formatDate(pool.endTime)}</p>
+                        </div>
+                          <div className="text-right ml-4 md:ml-6">
+                            <p className="text-black font-black text-base md:text-xl">
+                              {ethers.formatEther(pool.totalAmount)} MAZA
+                            </p>
+                            <p className="text-gray-700 text-xs md:text-sm font-bold">{Number(pool.totalEntries)} entries</p>
+                        </div>
+                          <div className="ml-2 md:ml-4 flex-shrink-0">
+                          <svg 
+                              className={`w-5 h-5 md:w-6 md:h-6 text-black transition-transform ${isExpanded ? 'rotate-180' : ''}`}
+                            fill="none" 
+                            stroke="currentColor" 
+                              strokeWidth="3"
+                            viewBox="0 0 24 24"
+                          >
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+                          </svg>
+                        </div>
+                      </button>
+
+                      {/* Expanded Content - Winners Details */}
+                      {isExpanded && hasWinners && (
+                          <div className="px-3 md:px-4 pb-3 md:pb-4 pt-3 md:pt-4 border-t-2 border-black">
+                            {/* FHE Winner Index Information */}
+                            {pool.winnerIndexHandles && pool.winnerIndexHandles.length > 0 && (
+                              <div className="mb-4 md:mb-6 p-3 md:p-4 bg-white border-2 border-black rounded-lg shadow-neo">
+                                <p className="text-black font-black text-sm md:text-lg mb-2 md:mb-3">
+                                  FHE Winner Index Handles
+                                </p>
+                                <div className="space-y-2">
+                                  {pool.winnerIndexHandles.map((handle, idx) => (
+                                    <div key={idx}>
+                                      <span className="text-xs md:text-sm font-bold text-gray-700">Winner {idx + 1} Handle:</span>
+                                      <p className="text-xs md:text-sm font-mono text-maza-pink break-all mt-1">
+                                        {handle}
+                                      </p>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            <p className="text-black font-black text-sm md:text-lg mb-3 md:mb-4 flex items-center gap-2 md:gap-3">
+                              <Trophy className="w-4 h-4 md:w-5 md:h-5" />
+                            Winners & Rewards
+                          </p>
+                            <div className="space-y-2 md:space-y-3">
+                            {poolWinners.map((winner, idx) => {
+                              const isUser = winner.address.toLowerCase() === account.toLowerCase();
+                              return (
+                                <div 
+                                  key={idx} 
+                                    className={`p-3 md:p-4 rounded-lg border-2 ${
+                                    isUser 
+                                        ? 'bg-maza-pink border-black' 
+                                        : 'bg-white border-black'
+                                  }`}
+                                >
+                                    <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 md:gap-3 mb-2 md:mb-3">
+                                    <div className="flex-1 min-w-0">
+                                        <div className="flex flex-wrap items-center gap-2 md:gap-3 mb-2">
+                                          <span className={`font-black text-sm md:text-lg ${isUser ? 'text-black' : 'text-maza-pink'}`}>
+                                          {isUser ? (
+                                              <span className="flex items-center gap-2">
+                                                <Trophy className="w-4 h-4 md:w-5 md:h-5 text-white" />
+                                              You
+                                            </span>
+                                          ) : `Winner ${idx + 1}`}
+                                        </span>
+                                        {isUser && (
+                                            <span className="px-2 md:px-3 py-1 bg-black text-maza-cream text-xs rounded-lg border-2 border-white font-black">
+                                            You
+                                          </span>
+                                        )}
+                                      </div>
+                                        <p className={`text-xs md:text-sm font-mono font-bold ${isUser ? 'text-white/90' : 'text-gray-700'}`}>
+                                        {truncateAddress(winner.address)}
+                                      </p>
+                                    </div>
+                                      <div className="text-right sm:text-left sm:ml-4">
+                                        <p className={`font-black text-base md:text-xl ${isUser ? 'text-black' : 'text-maza-pink'}`}>
+                                        {ethers.formatEther(winner.reward)} MAZA
+                                      </p>
+                                        <p className={`text-xs md:text-sm mt-1 font-bold ${isUser ? 'text-white/80' : 'text-gray-700'}`}>
+                                        {formatPercentage(winner.percentage)}% share
+                                      </p>
+                                    </div>
+                                  </div>
+                                    <div className="flex items-center justify-between mt-2 md:mt-3 pt-2 md:pt-3 border-t-2 border-black">
+                                      <span className={`text-xs md:text-sm font-black ${winner.claimed ? 'text-green-600' : 'text-black'}`}>
+                                      {winner.claimed ? (
+                                          <span className="flex items-center gap-2">
+                                            <CheckCircle2 className="w-3 h-3 md:w-4 md:h-4" />
+                                          Claimed
+                                        </span>
+                                      ) : (
+                                          <span className="flex items-center gap-2">
+                                            <Clock className="w-3 h-3 md:w-4 md:h-4" />
+                                          Pending
+                                        </span>
+                                      )}
+                                    </span>
+                                    {isUser && !winner.claimed && (
+                                      <button
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleClaimReward(pool.poolId);
+                                        }}
+                                        disabled={isClaiming}
+                                          className="px-3 md:px-4 py-1 md:py-2 bg-black text-maza-cream font-black text-xs md:text-sm rounded-lg border-2 border-white hover:bg-maza-pink hover:text-black disabled:opacity-50 transition-colors"
+                                      >
+                                        {isClaiming ? 'Claiming...' : 'Claim'}
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Show message if no winners yet */}
+                      {isExpanded && !hasWinners && (
+                          <div className="px-3 md:px-4 pb-3 md:pb-4 pt-3 md:pt-4 border-t-2 border-black">
+                            <p className="text-gray-700 text-sm md:text-lg text-center py-2 md:py-3 font-bold">
+                            {pool.isClosed ? 'Winners not drawn yet' : 'Pool still active'}
+                          </p>
+                            {/* Draw Winners Button for Owner */}
+                            {isOwner && pool.isClosed && !pool.winnersDrawn && pool.totalEntries >= 5n && (
+                              <div className="mt-4 flex justify-center">
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDrawWinners(pool.poolId);
+                                  }}
+                                  disabled={isDrawingWinners || fhevmStatus !== 'ready'}
+                                  className="px-4 md:px-6 py-2 md:py-3 bg-[#EA580C] text-white font-black text-sm md:text-base rounded-lg border-4 border-[#C2410C] hover:bg-[#C2410C] disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-[2px_2px_0px_0px_rgba(194,65,12,0.8)] hover:shadow-[3px_3px_0px_0px_rgba(194,65,12,0.8)] flex items-center gap-2"
+                                >
+                                  {isDrawingWinners ? (
+                                    <>
+                                      <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></div>
+                                      Drawing...
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Crown className="w-4 h-4 md:w-5 md:h-5" />
+                                      Draw Winners
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                            )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+        {/* Owner Panel - Single Draw Winners Button - Show when countdown is exactly 00:00 */}
+        {isOwner && poolData && poolData.startTime > 0n && timeRemaining === 0 && !poolData.winnersDrawn && (
+          <div className="bg-white border-2 border-black rounded-lg p-6 md:p-8 shadow-neo">
+            <div className="flex items-center gap-3 mb-6">
+              <Crown className="w-6 h-6 md:w-8 md:h-8 text-black" />
+              <h3 className="text-lg md:text-2xl font-black text-black uppercase">
+                Owner Panel
+              </h3>
+            </div>
+            {poolData.totalEntries >= 5n ? (
+              <>
+                <button
+                  onClick={() => handleDrawWinners()}
+                  disabled={isDrawingWinners || fhevmStatus !== 'ready'}
+                  className="w-full bg-black text-maza-cream font-black py-4 md:py-6 rounded-lg border-2 border-white shadow-neo hover:shadow-neo-hover hover:-translate-y-1 hover:-translate-x-1 disabled:opacity-50 disabled:cursor-not-allowed text-base md:text-xl transition-all flex items-center justify-center gap-3"
+                >
+                  {isDrawingWinners ? (
+                    <>
+                      <Loader2 className="w-5 h-5 md:w-6 md:h-6 animate-spin" />
+                      Drawing Winners...
+                    </>
+                  ) : (
+                    <>
+                      <Trophy className="w-5 h-5 md:w-6 md:h-6" />
+                      Draw Winners
+                    </>
+                  )}
+                </button>
+                <p className="text-gray-700 text-sm md:text-base mt-4 text-center font-bold">
+                  Generates random seed, decrypts, and draws winners automatically
+                </p>
+              </>
+            ) : (
+              <div className="flex items-start gap-3 md:gap-4 p-4 bg-maza-cream rounded-lg border-2 border-black">
+                <AlertCircle className="w-5 h-5 md:w-6 md:h-6 text-black flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-black font-black text-sm md:text-lg mb-2">
+                    Not Enough Participants
+                  </p>
+                  <p className="text-gray-700 text-xs md:text-base font-bold">
+                    Need at least 5 participants to draw winners. Current: {Number(poolData.totalEntries)}
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Current Pool Winners Display */}
+        {poolData && poolData.winnersDrawn && winners.length > 0 && (
+          <div className="bg-white border-2 border-black rounded-lg p-6 md:p-8 shadow-neo">
+            <div className="flex items-center gap-3 md:gap-4 mb-4 md:mb-6">
+              <Trophy className="w-6 h-6 md:w-8 md:h-8 text-black" />
+              <h3 className="text-xl md:text-3xl font-black text-black uppercase">
+                Winners - Pool #{currentPoolId}
+              </h3>
+            </div>
+            <div className="space-y-3 md:space-y-4">
+              {winners.map((winner, idx) => (
+                <div key={idx} className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 p-3 md:p-4 bg-maza-cream border-2 border-black rounded-lg">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-black font-black text-sm md:text-lg truncate mb-1">
+                      {winner.address.toLowerCase() === account.toLowerCase() ? (
+                        <span className="flex items-center gap-2">
+                          <Trophy className="w-4 h-4 md:w-5 md:h-5 text-black" />
+                          You!
+                        </span>
+                      ) : `Winner ${idx + 1}`}
+                    </p>
+                    <p className="text-gray-700 text-xs md:text-base truncate font-bold">
+                      {winner.address}
+                    </p>
+                  </div>
+                  <div className="text-left sm:text-right ml-0 sm:ml-4">
+                    <p className="text-maza-pink font-black text-base md:text-xl">
+                      {ethers.formatEther(winner.reward)} MAZA
+                    </p>
+                    <p className={`text-xs md:text-sm font-black ${winner.claimed ? 'text-green-600' : 'text-black'}`}>
+                      {winner.claimed ? 'Claimed' : 'Pending'}
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* User Winner Info for Current Pool */}
+        {userWinnerInfo && userWinnerInfo.isWinner && poolData && poolData.poolId === currentPoolId && (
+          <div className="bg-maza-cream border-2 border-black rounded-lg p-6 md:p-8 shadow-neo">
+            <div className="flex items-center gap-3 md:gap-4 mb-4 md:mb-6">
+              <Trophy className="w-6 h-6 md:w-8 md:h-8 text-black" />
+              <h3 className="text-xl md:text-3xl font-black text-black uppercase">
+                Congratulations! You're a Winner!
+              </h3>
+            </div>
+            <div className="space-y-4 md:space-y-6">
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 p-4 bg-white border-2 border-black rounded-lg shadow-neo">
+                <span className="text-black text-base md:text-xl font-black">
+                  Your Reward:
+                </span>
+                <span className="text-maza-pink font-black text-xl md:text-3xl">
+                  {ethers.formatEther(userWinnerInfo.reward)} MAZA
+                </span>
+              </div>
+              {!userWinnerInfo.claimed && (
+                <button
+                  onClick={() => handleClaimReward(currentPoolId)}
+                  disabled={isClaiming}
+                  className="w-full bg-black text-maza-cream font-black py-4 md:py-6 rounded-lg border-2 border-white shadow-neo hover:shadow-neo-hover hover:-translate-y-1 hover:-translate-x-1 disabled:opacity-50 text-base md:text-xl transition-all"
+                >
+                  {isClaiming ? 'Claiming...' : 'Claim Reward'}
+                </button>
+              )}
+              {userWinnerInfo.claimed && (
+                <div className="flex items-center justify-center gap-3 text-green-600 font-black text-base md:text-xl p-4 bg-green-100 border-4 border-green-600 rounded-lg">
+                  <CheckCircle2 className="w-5 h-5 md:w-6 md:h-6" />
+                  Reward Claimed!
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* FAQ FAB Button */}
+      <button
+        onClick={() => setShowFAQ(true)}
+        className="fixed bottom-6 right-6 w-14 h-14 md:w-16 md:h-16 bg-black text-maza-cream rounded-full border-2 border-white shadow-neo hover:shadow-neo-hover hover:-translate-y-1 hover:-translate-x-1 flex items-center justify-center transition-all duration-200 z-50 font-black"
+        aria-label="Open FAQ"
+      >
+        <HelpCircle className="w-7 h-7 md:w-8 md:h-8" />
+      </button>
+
+      {/* FAQ Modal */}
+      {showFAQ && (
+        <div className="fixed inset-0 bg-maza-cream/95 backdrop-blur-sm flex items-center justify-center z-[100] p-4 md:p-8 overflow-y-auto">
+          <div className="bg-maza-cream rounded-lg md:rounded-none shadow-neo-lg w-full max-w-2xl md:max-w-3xl border-2 border-black relative max-h-[90vh] overflow-y-auto">
+            {/* Header */}
+            <div className="sticky top-0 bg-maza-pink border-b-2 border-black p-4 md:p-6 flex items-center justify-between z-10">
+              <h2 className="text-2xl md:text-3xl font-black text-black uppercase">
+                Frequently Asked Questions
+              </h2>
+              <button
+                onClick={() => setShowFAQ(false)}
+                className="w-10 h-10 md:w-12 md:h-12 bg-black text-maza-cream rounded-lg border-2 border-white shadow-neo hover:translate-x-[2px] hover:translate-y-[2px] hover:shadow-neo-hover flex items-center justify-center transition-all duration-200"
+                aria-label="Close FAQ"
+              >
+                <X className="w-5 h-5 md:w-6 md:h-6" />
+              </button>
+            </div>
+
+            {/* FAQ Content */}
+            <div className="p-4 md:p-6 space-y-4 md:space-y-6">
+              <div className="bg-maza-cream border-2 border-black rounded-lg p-4 md:p-6 shadow-neo">
+                <h3 className="text-lg md:text-xl font-black text-black mb-2 md:mb-3">
+                  How does the raffle work?
+                </h3>
+                <p className="text-gray-800 text-sm md:text-base font-bold leading-relaxed">
+                  Each raffle pool runs for exactly 5 minutes. When someone enters, the timer starts. You pay 5 MAZA tokens to join. After 5 minutes, the pool closes automatically and 5 winners are randomly selected from all participants.
+                </p>
+              </div>
+
+              <div className="bg-maza-cream border-2 border-black rounded-lg p-4 md:p-6 shadow-neo">
+                <h3 className="text-lg md:text-xl font-black text-black mb-2 md:mb-3">
+                  How are winners selected?
+                </h3>
+                <p className="text-gray-800 text-sm md:text-base font-bold leading-relaxed">
+                  Winners are selected completely randomly using secure encryption technology. Every participant has an equal chance of winning, regardless of when they entered the pool. The selection is fair and cannot be manipulated.
+                </p>
+              </div>
+
+              <div className="bg-maza-cream border-2 border-black rounded-lg p-4 md:p-6 shadow-neo">
+                <h3 className="text-lg md:text-xl font-black text-black mb-2 md:mb-3">
+                  How much can I win?
+                </h3>
+                <p className="text-gray-800 text-sm md:text-base font-bold leading-relaxed">
+                  Winners share 90% of the total pool amount equally. For example, if 10 people enter (50 MAZA total), the 5 winners would share 45 MAZA, meaning each winner gets 9 MAZA. The remaining 10% goes to protocol fees.
+                </p>
+              </div>
+
+              <div className="bg-maza-cream border-2 border-black rounded-lg p-4 md:p-6 shadow-neo">
+                <h3 className="text-lg md:text-xl font-black text-black mb-2 md:mb-3">
+                  Can I enter multiple times?
+                </h3>
+                <p className="text-gray-800 text-sm md:text-base font-bold leading-relaxed">
+                  No, each wallet address can only enter once per pool. This ensures fairness and gives everyone an equal chance. You can enter the next pool once a new one starts!
+                </p>
+              </div>
+
+              <div className="bg-maza-cream border-2 border-black rounded-lg p-4 md:p-6 shadow-neo">
+                <h3 className="text-lg md:text-xl font-black text-black mb-2 md:mb-3">
+                  What happens if I win?
+                </h3>
+                <p className="text-gray-800 text-sm md:text-base font-bold leading-relaxed">
+                  If you're selected as a winner, you can claim your reward immediately after the winners are drawn. Your winnings will be sent directly to your wallet. Check the "Drawn Pools" section to see if you won and claim your reward!
+                </p>
+              </div>
+
+              <div className="bg-maza-cream border-2 border-black rounded-lg p-4 md:p-6 shadow-neo">
+                <h3 className="text-lg md:text-xl font-black text-black mb-2 md:mb-3">
+                  Is it safe and fair?
+                </h3>
+                <p className="text-gray-800 text-sm md:text-base font-bold leading-relaxed">
+                  Yes! The raffle uses advanced encryption technology (FHE) to ensure the random selection is completely fair and transparent. The random numbers used to pick winners are publicly verifiable, so you can always check that the selection was truly random.
+                </p>
+              </div>
+
+              <div className="bg-maza-cream border-2 border-black rounded-lg p-4 md:p-6 shadow-neo">
+                <h3 className="text-lg md:text-xl font-black text-black mb-2 md:mb-3">
+                  What if not enough people enter?
+                </h3>
+                <p className="text-gray-800 text-sm md:text-base font-bold leading-relaxed">
+                  At least 5 participants are needed to draw winners. If fewer than 5 people enter a pool, the pool will close but no winners will be drawn. The pool will then reset and a new pool will start.
+                </p>
+              </div>
+
+              <div className="bg-maza-cream border-2 border-black rounded-lg p-4 md:p-6 shadow-neo">
+                <h3 className="text-lg md:text-xl font-black text-black mb-2 md:mb-3">
+                  How do I claim my reward?
+                </h3>
+                <p className="text-gray-800 text-sm md:text-base font-bold leading-relaxed">
+                  If you're a winner, you'll see a "You Won!" tag with a crown icon on the pool card in the "Drawn Pools" section. Simply expand the pool card and click the "Claim" button. Your reward will be sent directly to your wallet, and you'll see a celebration animation! You can claim rewards from any pool you won, even if you've claimed from other pools before.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
