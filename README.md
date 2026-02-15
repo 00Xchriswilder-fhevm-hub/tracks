@@ -34,7 +34,7 @@ The FHE Raffle App is a pool-based raffle system that uses Fully Homomorphic Enc
 - ✅ **Pool System**: Sequential pools with unique IDs starting from 0
 - ✅ **Time-Based Pools**: 5-minute pool windows (configurable)
 - ✅ **ERC20 Integration**: Uses MAZA token for entry fees
-- ✅ **FHE Randomness**: Uses `FHE.randEuint32()` for cryptographically secure randomness
+- ✅ **FHE Randomness**: Uses `FHE.randEuint16()` for cryptographically secure randomness
 - ✅ **Winner Selection**: Selects 5 winners per pool using deterministic algorithm
 - ✅ **Reward Distribution**: 90% to winners (equal shares), 10% protocol fee
 - ✅ **Public Decryption**: Random seeds are publicly decryptable for verification
