@@ -101,7 +101,7 @@ export async function initializeFheInstance() {
                     setTimeout(checkSDK, 100);
                 } else {
                     console.error('❌ RelayerSDK timeout');
-                    reject(new Error('RelayerSDK not loaded. Please include the script tag in your HTML:\n<script src="https://cdn.zama.org/relayer-sdk-js/0.3.0-5/relayer-sdk-js.umd.cjs"></script>'));
+                    reject(new Error('RelayerSDK not loaded. Please include the script tag in your HTML:\n<script src="https://cdn.zama.org/relayer-sdk-js/0.4.2/relayer-sdk-js.umd.cjs"></script>'));
                 }
             };
             checkSDK();
